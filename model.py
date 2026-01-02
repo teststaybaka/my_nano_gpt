@@ -1,12 +1,11 @@
-import math
-from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 1024 # token length limit
     vocab_size: int = 50257
     n_layers: int = 12
     n_heads: int = 12 #nh
@@ -38,10 +37,13 @@ class CausalSelfAttention(nn.Module):
     q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) # (B, nh, T, hs)
     v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) # (B, nh, T, hs)
     # attention (materializes the large (T,T) matrix for all queries and keys)
-    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-    att = F.softmax(att, dim=-1)
-    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    
+    # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+    # att = F.softmax(att, dim=-1)
+    # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
     y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     # output projection
     y = self.c_proj(y)
@@ -133,12 +135,26 @@ class GPT(nn.Module):
     })
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    # weight sharing
+    self.transformer['wte'].weight = self.lm_head.weight
+
+    # init weights
+    self.apply(self._init_weights)
+  
+  def _init_weights(self, module):
+    if isinstance(module, nn.Linear):
+      nn.init.normal_(module.weight, mean=0.0, std=0.02)
+      if module.bias is not None:
+        nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+      nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
   def forward(self, idx, targets=None):
     # idx is of shape (B, T)
     B, T = idx.size()
     assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
     # forward the GPT model and positional embeddings
-    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+    pos = torch.arange(0, T, device=idx.device) # shape (T)
     pos_emb = self.transformer['wpe'](pos) # position embeddings of shape (T, n_embd)
     tok_emb = self.transformer['wte'](idx) # token embeddings of shape (B, T, n_embd)
     x = tok_emb + pos_emb # (B, T, n_embd)
@@ -148,49 +164,6 @@ class GPT(nn.Module):
     # forward the final layernorm and the classifier
     x = self.transformer.ln_f(x)
     logits = self.lm_head(x) # (B, T, vocab_size)
-    return logits
-
-# ---------------------------------
-num_return_sequences = 5
-max_length = 30
-
-model = GPT.from_pretrained('gpt2')
-model.eval()
-# model.to('cuda')
-
-# prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens
-# x = tokens.to('cuda')
-
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-  # forward the model to get the logits
-  with torch.no_grad():
-    logits = model(x) # (B, T, vocab_size)
-    # take the logits at the last position
-    logits = logits[:, -1, :] # (B, vocab_size)
-    # get the probabilities
-    probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-    # do top-k sampling of 50 (huggingface pipeline default)
-    # topk_probs here becomes (5, 50), tok_indices becomes (5, 50)
-    topk_probs, tok_indices = torch.topk(probs, k=50, dim=-1)
-    # select a token from the top-k candidates
-    ix = torch.multinomial(topk_probs, num_samples=1) # (5, 1)
-    # gather the token indices
-    tok = torch.gather(tok_indices, 1, ix) # (5, 1)
-    # append to the sequence and continue
-    x = torch.cat((x, tok), dim=1) # (5, T + 1)
-
-# print the generated text
-for i in range(num_return_sequences):
-  tokens = x[i, :max_length].tolist()
-  decoded = enc.decode(tokens)
-  print(">", decoded)
+    if targets is not None:
+      loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    return logits, loss
