@@ -1,13 +1,19 @@
+import os
 import time
 import math
 import torch
 import tiktoken
 from model import GPT, GPTConfig
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 class DataLoader:
-  def __init__(self, B, T):
+  def __init__(self, B, T, process_rank, process_count):
     self.B = B
     self.T = T
+    self.process_rank = process_rank
+    self.process_count = process_count
 
     enc = tiktoken.get_encoding("gpt2")
     with open('input.txt', 'r') as f:
@@ -38,7 +44,7 @@ class DataLoader:
     perm = torch.randperm(num_chunks)
     self.shuffled_chunks = chunks[perm]
 
-    self.current_position = 0
+    self.current_position = self.B * self.process_rank
 
   def get_batch(self):
     # Check if we have enough chunks left for a full batch
@@ -47,14 +53,11 @@ class DataLoader:
 
     # Get next B chunks
     batch_chunks = self.shuffled_chunks[self.current_position:self.current_position + self.B]
-    self.current_position += self.B
+    self.current_position += self.B * self.process_count
 
     # Split into x and y
     x = batch_chunks[:, :self.T]  # First T tokens of each chunk
     y = batch_chunks[:, 1:self.T+1]  # Tokens 1 to T+1 (shifted by 1)
-
-    x = x.to('cuda')
-    y = y.to('cuda')
     return x, y
 
 def configure_optimizer(model, weight_decay, betas):
@@ -69,6 +72,22 @@ def configure_optimizer(model, weight_decay, betas):
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
 
+distributed = int(os.environ.get('RANKED', '-1')) != -1
+if distributed:
+  init_process_group(backend='nccl')
+  rank = int(os.environ['RANK'])
+  local_rank = int(os.environ['LOCAL_RANK'])
+  world_size = int(os.environ['WORLD_SIZE'])
+  device = f'cuda:{local_rank}'
+  torch.cuda.set_device(device)
+  is_master = (rank == 0)
+else:
+  rank = 0
+  local_rank = 0
+  world_size = 1
+  is_master = True
+  device = 'cuda'
+
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
@@ -78,14 +97,19 @@ torch.set_float32_matmul_precision('high')
 total_batch_size = 524288 # 2**9 tokens
 B = 4  # batch size
 T = 1024 # context length
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}, grad_accum_steps: {grad_accum_steps}")
-dataloader = DataLoader(B=B, T=T)
+grad_accum_steps = total_batch_size // (B * T * world_size)
+if is_master:
+  print(f"total desired batch size: {total_batch_size}, world size: {world_size}, grad_accum_steps: {grad_accum_steps}")
+
+dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size)
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
-model.to('cuda')
+model.to(device)
 model = torch.compile(model)
+if distributed:
+  model = DDP(model, device_ids=[local_rank])
+raw_model = model.module if distributed else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -103,18 +127,24 @@ def get_lr(it):
   coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
   return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = configure_optimizer(model, weight_decay=1e-1, betas=(0.9, 0.95))
+optimizer = configure_optimizer(raw_model, weight_decay=1e-1, betas=(0.9, 0.95))
 for i in range(max_iters):
   t0 = time.time()
   optimizer.zero_grad()
   loss_accum = 0.0
   for micro_step in range(grad_accum_steps):
     x, y = dataloader.get_batch()
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    x = x.to(device)
+    y = y.to(device)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
       logits, loss = model(x, y)
     loss = loss / grad_accum_steps
     loss_accum += loss.detach()
+    if distributed:
+      model.requires_backward_grad_sync = (micro_step == grad_accum_steps - 1)
     loss.backward()
+  if distributed:
+    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   lr = get_lr(i)
   for param_group in optimizer.param_groups:
@@ -123,8 +153,12 @@ for i in range(max_iters):
   torch.cuda.synchronize()
   t1 = time.time()
   dt = (t1 - t0) * 1000
-  tokens_per_sec = (dataloader.T * dataloader.B * grad_accum_steps) / (dt / 1000)
-  print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
+  tokens_per_sec = (dataloader.T * dataloader.B * grad_accum_steps * world_size) / (dt / 1000)
+  if is_master:
+    print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
+
+if distributed:
+  destroy_process_group()
 
 # generate! right now x is (B, T) where B = 5, T = 8
 # set the seed to 42
