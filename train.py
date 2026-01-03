@@ -75,7 +75,12 @@ if torch.cuda.is_available():
 
 torch.set_float32_matmul_precision('high')
 
-dataloader = DataLoader(B=4, T=1024)
+total_batch_size = 524288 # 2**9 tokens
+B = 4  # batch size
+T = 1024 # context length
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}, grad_accum_steps: {grad_accum_steps}")
+dataloader = DataLoader(B=B, T=T)
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
@@ -102,10 +107,14 @@ optimizer = configure_optimizer(model, weight_decay=1e-1, betas=(0.9, 0.95))
 for i in range(max_iters):
   t0 = time.time()
   optimizer.zero_grad()
-  x, y = dataloader.get_batch()
-  with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-    logits, loss = model(x, y)
-  loss.backward()
+  loss_accum = 0.0
+  for micro_step in range(grad_accum_steps):
+    x, y = dataloader.get_batch()
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+      logits, loss = model(x, y)
+    loss = loss / grad_accum_steps
+    loss_accum += loss.detach()
+    loss.backward()
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   lr = get_lr(i)
   for param_group in optimizer.param_groups:
@@ -114,8 +123,8 @@ for i in range(max_iters):
   torch.cuda.synchronize()
   t1 = time.time()
   dt = (t1 - t0) * 1000
-  tokens_per_sec = (dataloader.T * dataloader.B) / (dt / 1000)
-  print(f"step {i}: loss {loss.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
+  tokens_per_sec = (dataloader.T * dataloader.B * grad_accum_steps) / (dt / 1000)
+  print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
 
 # generate! right now x is (B, T) where B = 5, T = 8
 # set the seed to 42
