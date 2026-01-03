@@ -72,7 +72,7 @@ def configure_optimizer(model, weight_decay, betas):
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
 
-distributed = int(os.environ.get('RANKED', '-1')) != -1
+distributed = int(os.environ.get('RANK', '-1')) != -1
 if distributed:
   init_process_group(backend='nccl')
   rank = int(os.environ['RANK'])
