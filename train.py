@@ -4,61 +4,10 @@ import math
 import torch
 import tiktoken
 from model import GPT, GPTConfig
+from fine_web_data_loader import DataLoader
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-
-class DataLoader:
-  def __init__(self, B, T, process_rank, process_count):
-    self.B = B
-    self.T = T
-    self.process_rank = process_rank
-    self.process_count = process_count
-
-    enc = tiktoken.get_encoding("gpt2")
-    with open('input.txt', 'r') as f:
-       text = f.read()
-    tokens = enc.encode(text)
-    self.tokens = torch.tensor(tokens)
-
-    # Initialize for epoch-based batching
-    self.current_position = 0
-    self._reset_epoch()
-
-  def _reset_epoch(self):
-    """Apply random offset, chunk tokens into lists of size T+1, then shuffle the chunks"""
-    # Apply random initial offset (0 to T)
-    offset = torch.randint(0, self.T + 1, (1,)).item()
-
-    # Start from offset and chunk into sequences of T+1 tokens
-    tokens_from_offset = self.tokens[offset:]
-    num_chunks = len(tokens_from_offset) // (self.T + 1)
-
-    # Truncate to fit exact number of chunks
-    usable_tokens = tokens_from_offset[:num_chunks * (self.T + 1)]
-
-    # Reshape into chunks of size (T+1)
-    chunks = usable_tokens.reshape(num_chunks, self.T + 1)
-
-    # Shuffle the chunks
-    perm = torch.randperm(num_chunks)
-    self.shuffled_chunks = chunks[perm]
-
-    self.current_position = self.B * self.process_rank
-
-  def get_batch(self):
-    # Check if we have enough chunks left for a full batch
-    if self.current_position + self.B > len(self.shuffled_chunks):
-      self._reset_epoch()
-
-    # Get next B chunks
-    batch_chunks = self.shuffled_chunks[self.current_position:self.current_position + self.B]
-    self.current_position += self.B * self.process_count
-
-    # Split into x and y
-    x = batch_chunks[:, :self.T]  # First T tokens of each chunk
-    y = batch_chunks[:, 1:self.T+1]  # Tokens 1 to T+1 (shifted by 1)
-    return x, y
 
 def configure_optimizer(model, weight_decay, betas):
   param_dict = {pn: p for pn, p in model.named_parameters()}
@@ -94,14 +43,14 @@ if torch.cuda.is_available():
 
 torch.set_float32_matmul_precision('high')
 
-total_batch_size = 524288 # 2**9 tokens
+total_batch_size = 524288 # 2**19 tokens
 B = 4  # batch size
 T = 1024 # context length
 grad_accum_steps = total_batch_size // (B * T * world_size)
 if is_master:
   print(f"total desired batch size: {total_batch_size}, world size: {world_size}, grad_accum_steps: {grad_accum_steps}")
 
-dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size)
+train_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="train")
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
@@ -113,8 +62,8 @@ raw_model = model.module if distributed else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_iters = 10
-max_iters = 50
+warmup_iters = 715
+max_iters = 19073
 def get_lr(it):
   # 1. linear warmup for warmup_iters steps
   if it < warmup_iters:
@@ -130,12 +79,30 @@ def get_lr(it):
 optimizer = configure_optimizer(raw_model, weight_decay=1e-1, betas=(0.9, 0.95))
 for i in range(max_iters):
   t0 = time.time()
+  # Valuation every 100 steps
+  if i % 100 == 0:
+    model.eval()
+    val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
+    with torch.no_grad():
+      val_loss_accum = 0.0
+      val_loss_steps = 20
+      for _ in range(val_loss_steps):
+        x, y = val_dataloader.get_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          logits, loss = model(x, y)
+        loss = loss / val_loss_steps
+        val_loss_accum += loss.detach()
+      if distributed:
+        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+      if is_master:
+        print(f"step {i}: validation loss {val_loss_accum.item()}")
+
   optimizer.zero_grad()
   loss_accum = 0.0
   for micro_step in range(grad_accum_steps):
-    x, y = dataloader.get_batch()
-    x = x.to(device)
-    y = y.to(device)
+    x, y = train_dataloader.get_batch()
+    x, y = x.to(device), y.to(device)
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
       logits, loss = model(x, y)
     loss = loss / grad_accum_steps
@@ -153,7 +120,7 @@ for i in range(max_iters):
   torch.cuda.synchronize()
   t1 = time.time()
   dt = (t1 - t0) * 1000
-  tokens_per_sec = (dataloader.T * dataloader.B * grad_accum_steps * world_size) / (dt / 1000)
+  tokens_per_sec = (train_dataloader.T * train_dataloader.B * grad_accum_steps * world_size) / (dt / 1000)
   if is_master:
     print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
 
