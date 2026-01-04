@@ -21,12 +21,9 @@ class DataLoader:
         self.shard_files = sorted(glob(pattern))
         assert len(self.shard_files) > 0, f"No shard files found for split '{split}' in {shard_dir}"
 
-        print(f"Found {len(self.shard_files)} shards for split '{split}'")
-
         # Initialize token buffer (can span multiple shards)
         self.token_buffer = torch.tensor([], dtype=torch.long)
         self.current_shard_idx = -1  # Haven't loaded any shard yet
-        self.current_position = 0
 
         # Set starting position for this process
         self.current_position = self.B * self.T * self.process_rank
@@ -35,8 +32,11 @@ class DataLoader:
         """Trim consumed tokens, load next shard, and reset position"""
         # Trim all consumed tokens before loading new shard
         if self.current_position > 0:
-            self.token_buffer = self.token_buffer[self.current_position:]
-            self.current_position = 0
+            if self.current_position >= len(self.token_buffer):
+                self.current_position -= len(self.token_buffer)
+            else:
+              self.token_buffer = self.token_buffer[self.current_position:]
+              self.current_position = 0
 
         # Load next shard and append to buffer
         next_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
@@ -53,9 +53,9 @@ class DataLoader:
         x[1] = tokens[pos+T:pos+2T],  y[1] = tokens[pos+T+1:pos+2T+1]
         ...
         """
-        # Ensure we have enough tokens in buffer from current position
-        tokens_needed = self.current_position + self.B * self.T + 1
-        while len(self.token_buffer) < tokens_needed:
+        # Ensure we have enough tokens in buffer from current position.
+        # self.current_position can be updated during _load_next_shard(), so we need to re-calculate the needed length.
+        while len(self.token_buffer) < self.current_position + self.B * self.T + 1:
             self._load_next_shard()
 
         # Extract consecutive batch from buffer using view (more efficient)
