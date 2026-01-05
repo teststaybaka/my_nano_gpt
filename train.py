@@ -3,11 +3,13 @@ import time
 import math
 import torch
 import tiktoken
+import json
 from model import GPT, GPTConfig
 from fine_web_data_loader import DataLoader
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import torch.nn.functional as F
 
 def configure_optimizer(model, weight_decay, betas):
   param_dict = {pn: p for pn, p in model.named_parameters()}
@@ -20,6 +22,111 @@ def configure_optimizer(model, weight_decay, betas):
   ]
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
+
+def valiation(model, B, T, device, rank, world_size, distributed, is_master, step):
+  val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
+  with torch.no_grad():
+    val_loss_accum = 0.0
+    val_loss_steps = 20
+    for _ in range(val_loss_steps):
+      x, y = val_dataloader.get_batch()
+      x, y = x.to(device), y.to(device)
+      with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+      loss = loss / val_loss_steps
+      val_loss_accum += loss.detach()
+    if distributed:
+      dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    if is_master:
+      print(f"step {step}: validation loss {val_loss_accum.item()}")
+
+def evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, step):
+  """Evaluate model on HellaSwag dataset, parallelized across GPUs"""
+
+  # Load HellaSwag data (all processes load it)
+  hellaswag_path = "hellaswag_data/hellaswag_val.jsonl"
+  if not os.path.exists(hellaswag_path):
+    if is_master:
+      print(f"HellaSwag data not found at {hellaswag_path}, skipping evaluation")
+    return
+
+  with open(hellaswag_path, 'r') as f:
+    examples = [json.loads(line) for line in f]
+
+  enc = tiktoken.get_encoding("gpt2")
+
+  num_correct = 0
+  num_total = 0
+  num_printed = 0  # Track how many examples we've printed
+
+  with torch.no_grad():
+    # Each GPU processes every world_size-th example
+    for idx in range(rank, len(examples), world_size):
+      example = examples[idx]
+      ctx = example['ctx']
+      endings = example['endings']
+      label = int(example['label'])
+
+      # Tokenize context once
+      ctx_tokens = enc.encode(ctx)
+
+      # Evaluate each ending
+      ending_losses = []
+      for ending in endings:
+        # Create full sequence: context + ending
+        full_text = ctx + " " + ending
+        tokens = enc.encode(full_text)
+
+        # Skip if sequence is too long for model
+        if len(tokens) > 1024:
+          ending_losses.append(float('inf'))
+          continue
+
+        # Convert to tensor
+        tokens_tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+
+        # Forward pass
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          logits, _ = model(tokens_tensor)
+
+        # Calculate loss only on ending tokens (mask out context)
+        # logits[0, i] predicts token at position i+1
+        # To predict ending tokens (positions ctx_len to end), use logits[ctx_len-1:-1]
+        ctx_len = len(ctx_tokens)
+        shift_logits = logits[0, ctx_len-1:-1, :]  # Predictions for ending
+        shift_labels = tokens_tensor[0, ctx_len:]  # Target ending tokens
+
+        # Calculate average cross entropy loss over ending tokens
+        loss = F.cross_entropy(shift_logits, shift_labels, reduction='mean')
+        ending_losses.append(loss.item())
+
+      # Choose ending with lowest loss as model's prediction
+      predicted = ending_losses.index(min(ending_losses))
+      if predicted == label:
+        num_correct += 1
+        # Print first 3 correct examples from master process for inspection
+        if is_master and num_printed < 3:
+          print(f"\n--- Correct Example {num_printed + 1} ---")
+          print(f"Context: {ctx}")
+          for i, ending in enumerate(endings):
+            marker = "✓ CORRECT" if i == label else ""
+            print(f"  [{i}] (loss={ending_losses[i]:.4f}) {ending} {marker}")
+          print(f"Model chose: {predicted}, Label: {label}")
+          num_printed += 1
+      num_total += 1
+
+  # Gather results from all GPUs
+  num_correct_tensor = torch.tensor(num_correct, dtype=torch.long, device=device)
+  num_total_tensor = torch.tensor(num_total, dtype=torch.long, device=device)
+
+  if distributed:
+    dist.all_reduce(num_correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(num_total_tensor, op=dist.ReduceOp.SUM)
+
+  # Calculate and print accuracy (on master)
+  if is_master:
+    accuracy = num_correct_tensor.item() / num_total_tensor.item()
+    print(f"step {step}: HellaSwag accuracy: {num_correct_tensor.item()}/{num_total_tensor.item()} = {accuracy:.4f}")
 
 distributed = int(os.environ.get('RANK', '-1')) != -1
 if distributed:
@@ -53,7 +160,6 @@ if is_master:
 train_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="train")
 
 model = GPT(GPTConfig(vocab_size=50304))
-model.eval()
 model.to(device)
 model = torch.compile(model)
 if distributed:
@@ -82,22 +188,10 @@ for i in range(max_iters):
   # Valuation every 100 steps
   if i % 100 == 0:
     model.eval()
-    val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
-    with torch.no_grad():
-      val_loss_accum = 0.0
-      val_loss_steps = 20
-      for _ in range(val_loss_steps):
-        x, y = val_dataloader.get_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-          logits, loss = model(x, y)
-        loss = loss / val_loss_steps
-        val_loss_accum += loss.detach()
-      if distributed:
-        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-      if is_master:
-        print(f"step {i}: validation loss {val_loss_accum.item()}")
+    valiation(model, B, T, device, rank, world_size, distributed, is_master, i)
+    evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, i)
 
+  model.train()
   optimizer.zero_grad()
   loss_accum = 0.0
   for micro_step in range(grad_accum_steps):
@@ -123,6 +217,9 @@ for i in range(max_iters):
   tokens_per_sec = (train_dataloader.T * train_dataloader.B * grad_accum_steps * world_size) / (dt / 1000)
   if is_master:
     print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
+
+valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters)
+evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, max_iters)
 
 if distributed:
   destroy_process_group()

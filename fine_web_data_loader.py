@@ -34,9 +34,10 @@ class DataLoader:
         if self.current_position > 0:
             if self.current_position >= len(self.token_buffer):
                 self.current_position -= len(self.token_buffer)
+                self.token_buffer = torch.tensor([], dtype=torch.long)
             else:
-              self.token_buffer = self.token_buffer[self.current_position:]
-              self.current_position = 0
+                self.token_buffer = self.token_buffer[self.current_position:]
+                self.current_position = 0
 
         # Load next shard and append to buffer
         next_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
