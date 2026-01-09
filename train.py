@@ -11,6 +11,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.nn.functional as F
 
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
 def configure_optimizer(model, weight_decay, betas):
   param_dict = {pn: p for pn, p in model.named_parameters()}
   param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -23,7 +29,7 @@ def configure_optimizer(model, weight_decay, betas):
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
 
-def valiation(model, B, T, device, rank, world_size, distributed, is_master, step):
+def valiation(model, B, T, device, rank, world_size, distributed, is_master, step, max_iters):
   val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
   with torch.no_grad():
     val_loss_accum = 0.0
@@ -38,7 +44,21 @@ def valiation(model, B, T, device, rank, world_size, distributed, is_master, ste
     if distributed:
       dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
     if is_master:
-      print(f"step {step}: validation loss {val_loss_accum.item()}")
+      print(f"step {step}: validation loss {val_loss_accum.item():.4f}")
+      with open(log_file, "a") as f:
+          f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+      if step > 0 and (step % 5000 == 0 or step == max_iters):
+          # optionally write model checkpoints
+          checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+          checkpoint = {
+              'model': raw_model.state_dict(),
+              'config': raw_model.config,
+              'step': step,
+              'val_loss': val_loss_accum.item()
+          }
+          # you might also want to add optimizer.state_dict() and
+          # rng seeds etc., if you wanted to more exactly resume training
+          torch.save(checkpoint, checkpoint_path)
 
 def evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, step):
   """Evaluate model on HellaSwag dataset, parallelized across GPUs"""
@@ -127,6 +147,8 @@ def evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, 
   if is_master:
     accuracy = num_correct_tensor.item() / num_total_tensor.item()
     print(f"step {step}: HellaSwag accuracy: {num_correct_tensor.item()}/{num_total_tensor.item()} = {accuracy:.4f}")
+    with open(log_file, "a") as f:
+        f.write(f"{step} hella {accuracy:.4f}\n")
 
 distributed = int(os.environ.get('RANK', '-1')) != -1
 if distributed:
@@ -188,7 +210,7 @@ for i in range(max_iters):
   # Valuation every 100 steps
   if i % 100 == 0:
     model.eval()
-    valiation(model, B, T, device, rank, world_size, distributed, is_master, i)
+    valiation(model, B, T, device, rank, world_size, distributed, is_master, i, max_iters)
     evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, i)
 
   model.train()
@@ -218,7 +240,7 @@ for i in range(max_iters):
   if is_master:
     print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
 
-valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters)
+valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters, max_iters)
 evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, max_iters)
 
 if distributed:
