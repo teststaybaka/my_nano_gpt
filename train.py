@@ -233,8 +233,8 @@ if args.resume:
 
 for i in range(start_step, max_iters):
   t0 = time.time()
-  # Valuation every 100 steps
-  if i % 100 == 0:
+  # Valuation every 500 steps
+  if i % 500 == 0:
     model.eval()
     valiation(model, B, T, device, rank, world_size, distributed, is_master, i)
     evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, i)
