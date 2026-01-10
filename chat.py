@@ -15,7 +15,7 @@ def load_model(checkpoint_path, device):
     model.to(device)
     model.eval()
 
-    print(f"Loaded model from step {checkpoint['step']} (val_loss: {checkpoint['val_loss']:.4f})")
+    print(f"Loaded model from step {checkpoint['step']}")
     return model
 
 def generate(model, enc, prompt, max_new_tokens=100, top_k=50, device='cuda'):

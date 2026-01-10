@@ -4,6 +4,7 @@ import math
 import torch
 import tiktoken
 import json
+import argparse
 from model import GPT, GPTConfig
 from fine_web_data_loader import DataLoader
 from torch.distributed import init_process_group, destroy_process_group
@@ -11,10 +12,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.nn.functional as F
 
+# Parse CLI arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+args = parser.parse_args()
+
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
+# Only clear log file if not resuming
+if not args.resume:
+  with open(log_file, "w") as f:
     pass
 
 def configure_optimizer(model, weight_decay, betas):
@@ -29,7 +37,7 @@ def configure_optimizer(model, weight_decay, betas):
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
 
-def valiation(model, B, T, device, rank, world_size, distributed, is_master, step, max_iters):
+def valiation(model, B, T, device, rank, world_size, distributed, is_master, step):
   val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
   with torch.no_grad():
     val_loss_accum = 0.0
@@ -47,18 +55,19 @@ def valiation(model, B, T, device, rank, world_size, distributed, is_master, ste
       print(f"step {step}: validation loss {val_loss_accum.item():.4f}")
       with open(log_file, "a") as f:
           f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-      if step > 0 and (step % 5000 == 0 or step == max_iters):
-          # optionally write model checkpoints
-          checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-          checkpoint = {
-              'model': raw_model.state_dict(),
-              'config': raw_model.config,
-              'step': step,
-              'val_loss': val_loss_accum.item()
-          }
-          # you might also want to add optimizer.state_dict() and
-          # rng seeds etc., if you wanted to more exactly resume training
-          torch.save(checkpoint, checkpoint_path)
+    return val_loss_accum.item()
+
+def save_checkpoint(step, is_master):
+  if not is_master or step == 0:
+    return
+  checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+  checkpoint = {
+      'model': raw_model.state_dict(),
+      'config': raw_model.config,
+      'step': step,
+  }
+  torch.save(checkpoint, checkpoint_path)
+  print(f"Saved checkpoint to {checkpoint_path}")
 
 def evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, step):
   """Evaluate model on HellaSwag dataset, parallelized across GPUs"""
@@ -205,13 +214,31 @@ def get_lr(it):
   return min_lr + coeff * (max_lr - min_lr)
 
 optimizer = configure_optimizer(raw_model, weight_decay=1e-1, betas=(0.9, 0.95))
-for i in range(max_iters):
+
+# Resume from checkpoint if specified
+start_step = 0
+if args.resume:
+  if os.path.exists(args.resume):
+    if is_master:
+      print(f"Resuming from checkpoint: {args.resume}")
+    checkpoint = torch.load(args.resume, map_location=device)
+    raw_model.load_state_dict(checkpoint['model'])
+    # No optimizer state loaded for simplicity
+    start_step = checkpoint['step'] + 1  # Start from next step
+    if is_master:
+      print(f"Resumed from step {checkpoint['step']}, starting at step {start_step}")
+  else:
+    if is_master:
+      print(f"Checkpoint not found: {args.resume}, starting from scratch")
+
+for i in range(start_step, max_iters):
   t0 = time.time()
   # Valuation every 100 steps
   if i % 100 == 0:
     model.eval()
-    valiation(model, B, T, device, rank, world_size, distributed, is_master, i, max_iters)
+    valiation(model, B, T, device, rank, world_size, distributed, is_master, i)
     evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, i)
+    save_checkpoint(i, is_master)
 
   model.train()
   optimizer.zero_grad()
@@ -240,36 +267,10 @@ for i in range(max_iters):
   if is_master:
     print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
 
-valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters, max_iters)
+model.eval()
+valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters)
 evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, max_iters)
+save_checkpoint(max_iters, is_master)
 
 if distributed:
   destroy_process_group()
-
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-# torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
-# while x.size(1) < max_length:
-#   # forward the model to get the logits
-#   with torch.no_grad():
-#     logits = model(x) # (B, T, vocab_size)
-#     # take the logits at the last position
-#     logits = logits[:, -1, :] # (B, vocab_size)
-#     # get the probabilities
-#     probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-#     # do top-k sampling of 50 (huggingface pipeline default)
-#     # topk_probs here becomes (5, 50), tok_indices becomes (5, 50)
-#     topk_probs, tok_indices = torch.topk(probs, k=50, dim=-1)
-#     # select a token from the top-k candidates
-#     ix = torch.multinomial(topk_probs, num_samples=1) # (5, 1)
-#     # gather the token indices
-#     tok = torch.gather(tok_indices, 1, ix) # (5, 1)
-#     # append to the sequence and continue
-#     x = torch.cat((x, tok), dim=1) # (5, T + 1)
-
-# # print the generated text
-# for i in range(num_return_sequences):
-#   tokens = x[i, :max_length].tolist()
-#   decoded = enc.decode(tokens)
-#   print(">", decoded)
