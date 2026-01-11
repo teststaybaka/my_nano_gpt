@@ -4,3 +4,4 @@ transformers
 tiktoken
 numpy
 datasets
+matplotlib
