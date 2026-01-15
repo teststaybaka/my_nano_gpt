@@ -1,5 +1,8 @@
 __pycache__/
+.venv/
 fineweb_shards/
 hellaswag_data/
+ultrachat_shards/
 log/
-.venv/
+finetune_log/
+model_clean.pt

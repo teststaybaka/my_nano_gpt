@@ -182,7 +182,7 @@ if torch.cuda.is_available():
 torch.set_float32_matmul_precision('high')
 
 total_batch_size = 524288 # 2**19 tokens
-B = 4  # batch size
+B = 32  # batch size
 T = 1024 # context length
 grad_accum_steps = total_batch_size // (B * T * world_size)
 if is_master:
@@ -200,7 +200,7 @@ raw_model = model.module if distributed else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_iters = 715
-max_iters = 19073
+max_iters = 19073 * 2
 def get_lr(it):
   # 1. linear warmup for warmup_iters steps
   if it < warmup_iters:
