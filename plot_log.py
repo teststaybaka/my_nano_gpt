@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 val_steps, val_losses = [], []
 hella_steps, hella_accs = [], []
 
-with open('final/log.txt', 'r') as f:
+with open('pretrained_final/log.txt', 'r') as f:
     for line in f:
         parts = line.strip().split()
         step = int(parts[0])
@@ -29,4 +29,4 @@ ax2.set_ylabel('Accuracy')
 ax2.set_title('HellaSwag Accuracy')
 
 plt.tight_layout()
-plt.savefig('final/training_curves.png')
+plt.savefig('pretrained_final/training_curves.png')

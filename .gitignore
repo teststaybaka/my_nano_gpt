@@ -5,4 +5,4 @@ hellaswag_data/
 ultrachat_shards/
 log/
 finetune_log/
-model_clean.pt
+model.pt
