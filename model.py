@@ -154,7 +154,7 @@ class GPT(nn.Module):
     B, T = idx.size()
     assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
     # forward the GPT model and positional embeddings
-    pos = torch.arange(0, T, device=idx.device) # shape (T)
+    pos = torch.arange(T - 1, -1, -1, device=idx.device) # shape (T)
     pos_emb = self.transformer['wpe'](pos) # position embeddings of shape (T, n_embd)
     tok_emb = self.transformer['wte'](idx) # token embeddings of shape (B, T, n_embd)
     x = tok_emb + pos_emb # (B, T, n_embd)
