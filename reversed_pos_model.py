@@ -42,7 +42,7 @@ class CausalSelfAttention(nn.Module):
     # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
     # att = F.softmax(att, dim=-1)
     # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     # output projection
@@ -149,21 +149,24 @@ class GPT(nn.Module):
     elif isinstance(module, nn.Embedding):
       nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-  def forward(self, idx, targets=None):
-    # idx is of shape (B, T)
-    B, T = idx.size()
+  def forward(self, seq, targets=None):
+    # seq is of shape (B, T)
+    B, T = seq.size()
     assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
-    # forward the GPT model and positional embeddings
-    pos = torch.arange(0, T, device=idx.device) # shape (T)
-    pos_emb = self.transformer['wpe'](pos) # position embeddings of shape (T, n_embd)
-    tok_emb = self.transformer['wte'](idx) # token embeddings of shape (B, T, n_embd)
-    x = tok_emb + pos_emb # (B, T, n_embd)
-    # forward the blocks of the transformer
-    for block in self.transformer.h:
-      x = block(x)
-    # forward the final layernorm and the classifier
-    x = self.transformer.ln_f(x)
-    logits = self.lm_head(x) # (B, T, vocab_size)
+    tok_emb = self.transformer['wte'](seq) # token embeddings of shape (B, T, n_embd)
+
+    logits_list = []
+    for q in range(T):
+      ctx = tok_emb[:, :q+1, :] # (B, q+1, n_embd)
+      pos = torch.arange(q, -1, -1, device=seq.device) # (q+1,)
+      pos_emb = self.transformer['wpe'](pos) # (q+1, n_embd)
+      x = ctx + pos_emb # (B, q+1, n_embd)
+      for block in self.transformer.h:
+        x = block(x)
+      x = self.transformer.ln_f(x)
+      logits_list.append(self.lm_head(x[:, -1, :])) # (B, vocab_size)
+
+    logits = torch.stack(logits_list, dim=1) # (B, T, vocab_size)
     loss = None
     if targets is not None:
       loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
