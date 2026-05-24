@@ -37,7 +37,7 @@ def configure_optimizer(model, weight_decay, betas):
   optimizer = torch.optim.AdamW(optim_groups, lr=1e-3, betas=betas, eps=1e-8, fused=True)
   return optimizer
 
-def valiation(model, B, T, device, rank, world_size, distributed, is_master, step):
+def validation(model, B, T, device, rank, world_size, distributed, is_master, step):
   val_dataloader = DataLoader(B=B, T=T, process_rank=rank, process_count=world_size, split="val")
   with torch.no_grad():
     val_loss_accum = 0.0
@@ -236,7 +236,7 @@ for i in range(start_step, max_iters):
   # Valuation every 500 steps
   if i % 500 == 0:
     model.eval()
-    valiation(model, B, T, device, rank, world_size, distributed, is_master, i)
+    validation(model, B, T, device, rank, world_size, distributed, is_master, i)
     evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, i)
     save_checkpoint(i, is_master)
 
@@ -268,7 +268,7 @@ for i in range(start_step, max_iters):
     print(f"step {i}: loss {loss_accum.item()}, lr {lr:.6f}, norm {norm:.4f}, dt {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec")
 
 model.eval()
-valiation(model, B, T, device, rank, world_size, distributed, is_master, max_iters)
+validation(model, B, T, device, rank, world_size, distributed, is_master, max_iters)
 evaluate_hellaswag(model, device, rank, world_size, distributed, is_master, max_iters)
 save_checkpoint(max_iters, is_master)
 
