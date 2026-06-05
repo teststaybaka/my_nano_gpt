@@ -45,7 +45,13 @@ config = GPTConfig(
     n_embd=saved.n_embd,
 )
 model = GPT(config).to(device)
-model.load_state_dict(checkpoint['model'])
+
+# Training script wraps the model in torch.compile() and saves the wrapper's
+# state_dict, which prefixes every key with '_orig_mod.'. Strip it for loading
+# into an uncompiled model.
+state_dict = checkpoint['model']
+state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
+model.load_state_dict(state_dict)
 model.eval()
 print(f"Loaded model from step {checkpoint['step']}")
 
