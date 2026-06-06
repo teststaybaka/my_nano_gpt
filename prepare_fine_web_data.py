@@ -1,4 +1,5 @@
 import os
+import argparse
 import numpy as np
 import tiktoken
 from datasets import load_dataset
@@ -17,13 +18,32 @@ def tokenize_doc(doc):
     return [EOT] + tokens  # Prepend EOT to each document
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sample', default='sample-100BT',
+                        choices=['sample-10BT', 'sample-100BT', 'sample-350BT'],
+                        help='Which fineweb-edu sample to download/tokenize.')
+    parser.add_argument('--output-dir', default='fineweb_shards',
+                        help='Where to write the .npy shards. Defaults to "fineweb_shards" so '
+                             'the existing data loader picks them up without changes — note this '
+                             'overwrites any shards already in that dir.')
+    parser.add_argument('--tokens-per-shard', type=int, default=100_000_000,
+                        help='Shard size. Default 100M tokens.')
+    args = parser.parse_args()
+
     # Configuration
     dataset_name = "HuggingFaceFW/fineweb-edu"
-    sample_name = "sample-10BT"
-    output_dir = "fineweb_shards"
+    sample_name = args.sample
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    tokens_per_shard = 100_000_000  # 100M tokens per shard
+    # Warn if the dir already has shards (likely a previous sample size).
+    existing = [f for f in os.listdir(output_dir) if f.endswith('.npy')]
+    if existing:
+        print(f"WARNING: {output_dir} already contains {len(existing)} .npy shard(s). "
+              f"Shard indices will be reused/overwritten. Move or delete the old dir if "
+              f"you want to keep both samples.\n")
+
+    tokens_per_shard = args.tokens_per_shard
     nprocs = mp.cpu_count()
     batch_size = 16  # Process 16 docs at a time in parallel
 

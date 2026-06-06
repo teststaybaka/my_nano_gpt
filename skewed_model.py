@@ -147,10 +147,11 @@ class GPT(nn.Module):
     elif isinstance(module, nn.Embedding):
       nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-  def forward(self, idx, targets, kv_caches=None, prev_tokens=None):
+  def forward(self, idx, targets=None, kv_caches=None, prev_tokens=None):
     """
     idx: (B, T_new) — this chunk's new token ids.
-    targets: (B, T_new) — next-token targets aligned with idx.
+    targets: (B, T_new) — next-token targets aligned with idx. Pass None at eval to
+             skip the cross-entropy computation; loss will be returned as None.
     kv_caches: list of n_layers (K, V) entries, each (B, n_heads, T_cache, head_size),
                or None for the prefill chunk. Skew routing:
                  kv_caches[ℓ] is consumed by THIS chunk's layer ℓ, and was
@@ -160,7 +161,7 @@ class GPT(nn.Module):
     prev_tokens: (B, 1) — last token from the previous chunk, or the seed.
     Returns:
       logits: (B, T_new, vocab_size)
-      loss: scalar cross-entropy averaged over all T_new positions
+      loss: scalar cross-entropy averaged over all T_new positions, or None if targets is None.
       new_kv_caches: list of n_layers (K, V) for the next call (NOT detached).
                      Skew packing:
                        new_kv_caches[ℓ-1] = this chunk's layer ℓ output (for ℓ ≥ 1)
@@ -194,7 +195,9 @@ class GPT(nn.Module):
     # Logits branch (separate LN from the K/V branch — both consume the same x).
     x = self.ln_f(x)
     logits = self.lm_head(x)                                # (B, T_new, vocab_size)
-    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    loss = None
+    if targets is not None:
+      loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
     new_prev_tokens = idx[:, -1:]                           # carry last token to next chunk
     return logits, loss, new_kv_caches, new_prev_tokens
