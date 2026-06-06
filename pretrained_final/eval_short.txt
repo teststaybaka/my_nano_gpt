@@ -1,0 +1,18 @@
+model.pt
+  HellaSwag: 0.3197
+  LAMBADA: 0.2723 30.4044
+pair_sum_model.pt
+  HellaSwag: 0.3140
+  LAMBADA: 0.2459 38.9326
+pair_sum_sliding_cache_model.pt
+  HellaSwag: 0.3166
+  LAMBADA: 0.2366 41.8238
+pair_sum_sliding_cache_32x_context_model.pt
+  HellaSwag: 0.3146
+  LAMBADA: 0.2451 44.1442
+pair_sum_skewed_cache_model.pt
+  HellaSwag: 0.3152
+  LAMBADA: 0.2476 42.4590
+pair_sum_skewed_cache_32x_context_model.pt
+  HellaSwag: 0.3149
+  LAMBADA: 0.2441 39.3536
