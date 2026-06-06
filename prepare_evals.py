@@ -46,8 +46,8 @@ def download_pg19():
     output_dir = "pg19_data"
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "pg19_val.jsonl")
-    print(f"  loading deepmind/pg19 validation split via HuggingFace datasets…")
-    ds = load_dataset("deepmind/pg19", split="validation")
+    print(f"  loading emozilla/pg19 validation split via HuggingFace datasets…")
+    ds = load_dataset("emozilla/pg19", split="validation")
     print(f"  →   {output_path}")
     total_chars = 0
     with open(output_path, 'w', encoding='utf-8') as f:

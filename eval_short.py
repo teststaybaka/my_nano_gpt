@@ -52,13 +52,16 @@ def load_checkpoint(checkpoint_path, GPT, GPTConfig, device):
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     saved = checkpoint['config']
-    # Rebuild config with this script's GPTConfig to avoid pickle module mismatch.
+    # Older checkpoints stored config as a plain dict; newer ones store the dataclass
+    # object. Rebuild with this script's GPTConfig either way to dodge pickle mismatch.
+    def _get(attr):
+        return saved[attr] if isinstance(saved, dict) else getattr(saved, attr)
     config = GPTConfig(
-        block_size=saved.block_size,
-        vocab_size=saved.vocab_size,
-        n_layers=saved.n_layers,
-        n_heads=saved.n_heads,
-        n_embd=saved.n_embd,
+        block_size=_get('block_size'),
+        vocab_size=_get('vocab_size'),
+        n_layers=_get('n_layers'),
+        n_heads=_get('n_heads'),
+        n_embd=_get('n_embd'),
     )
     model = GPT(config).to(device)
     # Strip torch.compile's '_orig_mod.' prefix if present.
