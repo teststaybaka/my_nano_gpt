@@ -11,7 +11,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 
 
@@ -218,13 +217,10 @@ class GPT(nn.Module):
         x = tok_emb[:, :-1, :] + tok_emb[:, 1:, :]              # (B, T_new, n_embd)
 
         # Forward through layers, collecting each layer's K[ℓ], V[ℓ].
-        # Activation checkpointing: don't keep block internals (attention scores,
-        # MLP hidden, etc.) for backward — recompute them by re-running the block
-        # forward. Trades ~33% compute for ~10x activation memory at long BPTT.
         computed_kv = []
         for layer_idx, block in enumerate(self.h):
             layer_cache = None if caches is None else caches[layer_idx]
-            x, (k_new, v_new) = checkpoint(block, x, layer_cache, use_reentrant=False)
+            x, (k_new, v_new) = block(x, cache=layer_cache)
             computed_kv.append((k_new, v_new))
 
         # K[L], V[L] for the deepest layer's high_cache routing.
