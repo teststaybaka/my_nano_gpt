@@ -1,3 +1,12 @@
+"""Diff from model.py (standard GPT):
+- Replaces learned positional embeddings (wpe) with RoPE: a position-dependent
+  rotation applied to Q and K (not V) inside attention. cos/sin tables precomputed
+  once as non-persistent buffers (recomputable from config).
+- Split-half (Llama/GPT-NeoX) RoPE convention. Base frequency configurable.
+- Otherwise identical to model.py: full causal attention, weight tying,
+  same (idx, targets) → (logits, loss) signature.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

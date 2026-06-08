@@ -1,3 +1,7 @@
+"""Diff from model.py (standard GPT):
+- Pair-sum input embedding: x[i] = wte(idx[i - 1]) + wte(idx[i]), replacing positional embedding.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

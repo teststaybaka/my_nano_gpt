@@ -1,3 +1,13 @@
+"""Diff from model.py (standard GPT):
+- Pair-sum input embedding: x[i] = wte(idx[i - 1]) + wte(idx[i]), replacing positional embedding.
+- Each attention head has a sliding window of size W = block_size, attending to the last W K/V pairs.
+- KV cache carry and is skewed: each forward() returns new K/V for the chunk, moves back by one layer
+  and stacks them on top of the next step's K/V pairs. layer ℓ's queries attend to previous chunk's
+  K[ℓ+1] (one layer deeper) instead of previous chunk's K[ℓ].
+- Adds a K/V only module above the top block to supply K[L] for layer L-1's cache slot
+  (since there's no real layer above the deepest one).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

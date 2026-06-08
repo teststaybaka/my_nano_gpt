@@ -1,3 +1,9 @@
+"""Diff from model.py (standard GPT):
+- No positional embedding.
+- Each attention head gets its own sliding-window size T_h, log-uniformly spaced
+  from min_window to block_size. Per-head SDPA mask; no per-head storage change.
+"""
+
 import math
 import torch
 import torch.nn as nn
