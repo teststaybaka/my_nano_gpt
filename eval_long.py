@@ -2,19 +2,22 @@
 
 Two chunking strategies depending on model family:
 
-  standard / pair_sum  → sliding-window stride. Each window is block_size
-      tokens; subsequent windows advance by --stride tokens. Each token is
-      scored from the window where it has maximum in-window left context.
+  standard / rope / multi_scale / pair_sum  → sliding-window stride. Each window
+      is block_size tokens; subsequent windows advance by --stride tokens. Each
+      token is scored from the window where it has maximum in-window left context.
 
-  sliding / skewed     → cache carry-forward. Chunks of block_size, with
+  sliding / skewed   → cache carry-forward. Chunks of block_size, with
       kv_caches and prev_tokens threaded forward, just like training.
+
+  stair              → cache carry-forward with chunks of block_size/2 (stair's
+      strict per-query W/2 stair requires T_new ≤ W/2 per forward).
 
 Reports per-length perplexity over the first --lengths tokens of each
 qualifying book, so you get a curve showing context utility across
 families and over distances.
 
 Usage:
-  python eval_long.py <checkpoint.pt> --model {standard|pair_sum|sliding|skewed}
+  python eval_long.py <checkpoint.pt> --model {standard|rope|multi_scale|pair_sum|sliding|skewed|stair}
                                        [--lengths 1024,2048,4096,8192,16384]
                                        [--stride 512]
                                        [--max-books N]
@@ -33,7 +36,9 @@ from eval_short import load_model_module, load_checkpoint
 # ---- cache family: carry kv_caches & prev_tokens forward ----------------
 
 def eval_long_cache(model, tokens_t, T, device):
-    """tokens_t: (1, N) long.
+    """tokens_t: (1, N) long. T is the per-forward chunk size
+    (block_size for sliding/skewed, block_size/2 for stair).
+
     Returns (nll_buf, scored_buf) of shape (N,) each, where
       nll_buf[p]    = -log P(tokens[p] | tokens[:p]) for scored positions, 0 otherwise
       scored_buf[p] = True iff position p was scored.
@@ -41,12 +46,15 @@ def eval_long_cache(model, tokens_t, T, device):
     Cache-family alignment (with prev_tokens = tokens[:,pos-1:pos], idx = tokens[:,pos:end]):
       logits[i] predicts absolute position (pos + i + 1).
     The very first 2 positions are never scorable (pair-sum cold start).
+
+    Model is called positionally: model(idx, None, cache_state, prev_tokens) — this
+    works for both sliding/skewed (kwarg kv_caches) and stair (kwarg caches).
     """
     N = tokens_t.size(1)
     nll_buf = torch.zeros(N, device=device)
     scored_buf = torch.zeros(N, dtype=torch.bool, device=device)
 
-    kv_caches = None
+    cache_state = None  # kv_caches or caches depending on model — opaque here
     prev_tokens = tokens_t[:, 0:1]
     pos = 1  # absolute position of first new idx token
 
@@ -57,8 +65,7 @@ def eval_long_cache(model, tokens_t, T, device):
         if T_new < 1:
             break
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, _, kv_caches, prev_tokens = model(
-                idx, kv_caches=kv_caches, prev_tokens=prev_tokens)
+            logits, _, cache_state, prev_tokens = model(idx, None, cache_state, prev_tokens)
         # logits[i] predicts absolute position pos+i+1. Valid iff pos+i+1 < N
         # AND iff i < T_new (so we don't run past returned logits).
         max_i = min(T_new - 1, N - pos - 2)
@@ -146,7 +153,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint', type=str, help='Path to .pt checkpoint')
     parser.add_argument('--model', required=True,
-                        choices=['standard', 'pair_sum', 'sliding', 'skewed'])
+                        choices=['standard', 'rope', 'multi_scale', 'pair_sum', 'sliding', 'skewed', 'stair'])
     parser.add_argument('--lengths', default='1024,2048,4096,8192,16384',
                         help='Comma-separated lengths at which to report perplexity.')
     parser.add_argument('--stride', type=int, default=512,
@@ -168,6 +175,8 @@ def main():
         if args.stride > config.block_size:
             raise SystemExit(f"--stride ({args.stride}) cannot exceed block_size ({config.block_size})")
         print(f"Strategy: sliding-window stride (W={config.block_size}, S={args.stride})")
+    elif family == 'stair_cache':
+        print(f"Strategy: cache carry-forward (chunk T={config.block_size // 2}, stair W/2)")
     else:
         print(f"Strategy: cache carry-forward (chunk T={config.block_size})")
     print(f"Lengths: {lengths}\n")
@@ -195,6 +204,8 @@ def main():
         with torch.no_grad():
             if family == 'cache':
                 nll_buf, scored_buf = eval_long_cache(model, tokens_t, config.block_size, device)
+            elif family == 'stair_cache':
+                nll_buf, scored_buf = eval_long_cache(model, tokens_t, config.block_size // 2, device)
             else:
                 nll_buf, scored_buf = eval_long_stride(
                     model, family, tokens_t, config.block_size, args.stride, device)

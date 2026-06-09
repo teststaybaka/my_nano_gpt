@@ -1,20 +1,24 @@
 """Short-context evals: HellaSwag (4-way MCQ commonsense completion) and
 LAMBADA (last-word cloze) on a trained checkpoint.
 
-Supports all four model families via --model:
-  standard  → model.py            forward(idx, targets=None) → (logits, loss)
-  pair_sum  → pair_sum_model.py   forward(idx, targets=None) → (logits, loss)
-  sliding   → sliding_cache_model forward(idx, targets, kv_caches, prev_tokens)
-  skewed    → skewed_model        forward(idx, targets, kv_caches, prev_tokens)
+Supports all model families via --model:
+  standard     → model.py            forward(idx, targets=None) → (logits, loss)
+  rope         → rope_model.py       forward(idx, targets=None) → (logits, loss)
+  multi_scale  → multi_scale_model   forward(idx, targets=None) → (logits, loss)
+  pair_sum     → pair_sum_model.py   forward(idx, targets=None) → (logits, loss)
+  sliding      → sliding_cache_model forward(idx, targets, kv_caches, prev_tokens)
+  skewed       → skewed_model        forward(idx, targets, kv_caches, prev_tokens)
+  stair        → stair_model         forward(idx, targets, caches,    prev_tokens)
+                 (requires T_new ≤ block_size/2 per forward — we chunk internally)
 
-Standard's logits[i] predicts seq[i+1]; the other three predict seq[i+2]
-(pair-sum offset). We hide that asymmetry behind compute_logp_per_token().
+Standard/rope/multi_scale logits[i] predicts seq[i+1]; the other four predict
+seq[i+2] (pair-sum offset). We hide that asymmetry behind compute_logp_per_token().
 
-Sequences here all fit in one block_size=1024 window, so no chunking — that
-lives in eval_long.py.
+Sequences in HellaSwag/LAMBADA all fit in one block_size=1024 window. For most
+families that means one forward; stair chunks at W/2 internally.
 
 Usage:
-  python eval_short.py <checkpoint.pt> --model {standard|pair_sum|sliding|skewed}
+  python eval_short.py <checkpoint.pt> --model {standard|rope|multi_scale|pair_sum|sliding|skewed|stair}
                                        [--task {hellaswag|lambada|all}]
                                        [--max-examples N]
 """
@@ -31,11 +35,17 @@ import torch.nn.functional as F
 
 def load_model_module(name):
     """Returns (GPT_cls, GPTConfig_cls, family) where family ∈
-    {'standard', 'pair_sum', 'cache'}. Family controls forward signature
-    and logit-shift convention; underlying model class is the variant."""
+    {'standard', 'pair_sum', 'cache', 'stair_cache'}. Family controls forward
+    signature and logit-shift convention; underlying model class is the variant."""
     if name == 'standard':
         from model import GPT, GPTConfig
         return GPT, GPTConfig, 'standard'
+    if name == 'rope':
+        from rope_model import GPT, GPTConfig
+        return GPT, GPTConfig, 'standard'  # same forward signature & alignment
+    if name == 'multi_scale':
+        from multi_scale_model import GPT, GPTConfig
+        return GPT, GPTConfig, 'standard'  # same forward signature & alignment
     if name == 'pair_sum':
         from pair_sum_model import GPT, GPTConfig
         return GPT, GPTConfig, 'pair_sum'
@@ -45,7 +55,10 @@ def load_model_module(name):
     if name == 'skewed':
         from skewed_model import GPT, GPTConfig
         return GPT, GPTConfig, 'cache'
-    raise SystemExit(f"unknown --model {name!r}; choose from standard|pair_sum|sliding|skewed")
+    if name == 'stair':
+        from stair_model import GPT, GPTConfig
+        return GPT, GPTConfig, 'stair_cache'
+    raise SystemExit(f"unknown --model {name!r}; choose from standard|rope|multi_scale|pair_sum|sliding|skewed|stair")
 
 
 def load_checkpoint(checkpoint_path, GPT, GPTConfig, device):
@@ -83,10 +96,12 @@ def compute_logp_per_token(model, family, tokens, device):
     For i < first_scored, both arrays carry sentinel values (0.0 and -1).
 
     Family alignment:
-      standard : feed tokens[:-1], logits[i] predicts tokens[i+1], first_scored=1
-      pair_sum : feed tokens     , logits[i] predicts tokens[i+2], first_scored=2
-      cache    : feed prev=tokens[:,:1], idx=tokens[:,1:],
-                 logits[i] predicts tokens[i+2], first_scored=2
+      standard    : feed tokens[:-1], logits[i] predicts tokens[i+1], first_scored=1
+      pair_sum    : feed tokens     , logits[i] predicts tokens[i+2], first_scored=2
+      cache       : feed prev=tokens[:,:1], idx=tokens[:,1:],
+                    logits[i] predicts tokens[i+2], first_scored=2
+      stair_cache : same alignment as cache, but model asserts T_new ≤ W/2 so we
+                    chunk idx into W/2 pieces and thread caches across them.
     """
     N = tokens.size(1)
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -103,6 +118,25 @@ def compute_logp_per_token(model, family, tokens, device):
             idx = tokens[:, 1:]
             logits, _, _, _ = model(idx, prev_tokens=prev_tokens)
             shift_logits = logits[0, :N-2, :]            # logits[i] → tokens[i+2], drop last
+            first_scored = 2
+        elif family == 'stair_cache':
+            # Stair requires chunking at W/2. Positional call so the kwarg name
+            # difference (caches vs kv_caches) doesn't matter.
+            chunk_size = model.config.block_size // 2
+            prev_tokens = tokens[:, 0:1]
+            idx = tokens[:, 1:]
+            M = idx.size(1)
+            cache_state = None
+            all_logits = []
+            pos = 0
+            while pos < M:
+                end = min(pos + chunk_size, M)
+                chunk_logits, _, cache_state, prev_tokens = model(
+                    idx[:, pos:end], None, cache_state, prev_tokens)
+                all_logits.append(chunk_logits)
+                pos = end
+            logits = torch.cat(all_logits, dim=1)         # (1, M, V); M = N-1
+            shift_logits = logits[0, :N-2, :]             # logits[i] → tokens[i+2], drop last
             first_scored = 2
         else:
             raise ValueError(family)
@@ -249,7 +283,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint', type=str, help='Path to .pt checkpoint')
     parser.add_argument('--model', type=str, required=True,
-                        choices=['standard', 'pair_sum', 'sliding', 'skewed'])
+                        choices=['standard', 'rope', 'multi_scale', 'pair_sum', 'sliding', 'skewed', 'stair'])
     parser.add_argument('--task', type=str, default='all',
                         choices=['hellaswag', 'lambada', 'all'])
     parser.add_argument('--max-examples', type=int, default=None,
