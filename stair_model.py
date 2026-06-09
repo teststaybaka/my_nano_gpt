@@ -43,15 +43,17 @@ class StairAttention(nn.Module):
 
     def forward(self, x, cache=None):
         """
-        x: (B, T_new, C) — current chunk; require T_new <= W/2 for strict stair semantics.
-        cache: optional ((K_low_prev, V_low_prev), (K_high_prev, V_high_prev)) — both halves
-               are always present together (set by GPT.forward in lockstep). None only for
-               the first chunk of a shard.
-                 low_prev:  K[ℓ], V[ℓ] from previous chunk (steady-state size W/2 - 1).
-                 high_prev: K[ℓ+1], V[ℓ+1] from previous chunks (steady-state size W - 1).
+        x: (B, T_new, C) — current chunk; assume T_new = W/2 in training (asserted ≤ in GPT).
+        cache: optional (low_new, high_old, high_new) — three raw chunk K/V tensors:
+                 low_new:  (K[ℓ],   V[ℓ])   from previous chunk N-1
+                 high_new: (K[ℓ+1], V[ℓ+1]) from previous chunk N-1
+                 high_old: (K[ℓ+1], V[ℓ+1]) from previous chunk N-2, or None during warmup (N=1)
+               None entirely for the first chunk of a shard (N=0). low_new and high_new
+               are both from chunk N-1; high_old is from chunk N-2.
+               Each tensor is W/2 positions — no concat/trim at chunk boundaries.
         Returns:
           y: (B, T_new, C)
-          (k, v): this chunk's K[ℓ], V[ℓ] — caller routes to next chunk's caches.
+          (k, v): this chunk's K[ℓ], V[ℓ] — caller routes into the next chunk's cache.
         """
         B, T_new, C = x.size()
         head_size = C // self.n_heads
@@ -69,32 +71,38 @@ class StairAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             return self._merge_heads(y, B, T_new, C), (k, v)
 
-        (K_low_prev, V_low_prev), (K_high_prev, V_high_prev) = cache
+        low_new, high_old, high_new = cache
+        K_low, V_low = low_new
+        K_high_new, V_high_new = high_new
+        T_low = K_low.size(2)
 
-        # K_low = previous chunk's K[ℓ] cache + this chunk's live K[ℓ]
-        K_low = torch.cat([K_low_prev, k], dim=2)
-        V_low = torch.cat([V_low_prev, v], dim=2)
-        T_low_prev = K_low_prev.size(2)
-        T_high = K_high_prev.size(2)
-
-        # Stack K_high then K_low for a single SDPA call.
-        K_combined = torch.cat([K_high_prev, K_low], dim=2)
-        V_combined = torch.cat([V_high_prev, V_low], dim=2)
+        # Assemble K_combined with one cat instead of building K_low then K_combined.
+        # K_high positions go first, then K_low + live k.
+        if high_old is None:
+            # Warmup (chunk N=1): chunk N-2 doesn't exist. K_high is just N-1's K[ℓ+1].
+            K_combined = torch.cat([K_high_new, K_low, k], dim=2)
+            V_combined = torch.cat([V_high_new, V_low, v], dim=2)
+        else:
+            # Steady state: K_high = [N-2's K[ℓ+1], N-1's K[ℓ+1]] (contiguous absolute positions).
+            K_high_old, V_high_old = high_old
+            K_combined = torch.cat([K_high_old, K_high_new, K_low, k], dim=2)
+            V_combined = torch.cat([V_high_old, V_high_new, V_low, v], dim=2)
+        T_high_total = K_combined.size(2) - T_low - T_new
 
         # Build mask. Anchor positions relative to current chunk start = 0.
-        # K_high_prev covers absolute positions [-T_high, -1]
-        # K_low       covers absolute positions [-T_low_prev, T_new - 1]
+        # K_high portion (first T_high_total cols) covers absolute positions [-T_high_total, -1].
+        # K_low portion (remaining cols)         covers absolute positions [-T_low, T_new - 1].
         # Stair rule per query q:
-        #   recent W/2 (use K_low):  positions [q - half_W + 1, q]      → 0 <= dist < half_W
-        #   older W/2  (use K_high): positions [q - W + 1, q - half_W]  → half_W <= dist < W
+        #   recent W/2 (use K_low):  0 <= dist < half_W
+        #   older W/2  (use K_high): half_W <= dist < W
         q_pos = torch.arange(T_new, device=q.device)
 
-        high_pos = torch.arange(-T_high, 0, device=q.device)
-        high_dist = q_pos.unsqueeze(1) - high_pos.unsqueeze(0) # (T_new, T_high)
+        high_pos = torch.arange(-T_high_total, 0, device=q.device)
+        high_dist = q_pos.unsqueeze(1) - high_pos.unsqueeze(0) # (T_new, T_high_total)
         high_mask = (high_dist >= half_W) & (high_dist < W)
 
-        low_pos = torch.arange(-T_low_prev, T_new, device=q.device)
-        low_dist = q_pos.unsqueeze(1) - low_pos.unsqueeze(0) # (T_new, T_low)
+        low_pos = torch.arange(-T_low, T_new, device=q.device)
+        low_dist = q_pos.unsqueeze(1) - low_pos.unsqueeze(0) # (T_new, T_low + T_new)
         low_mask = (low_dist >= 0) & (low_dist < half_W)
 
         mask = torch.cat([high_mask, low_mask], dim=1)
@@ -155,19 +163,7 @@ class KVOnly(nn.Module):
         return k, v
 
 
-def _trim(t, max_size):
-    """Trim a (B, nh, T, hd) tensor to its last max_size positions along dim 2."""
-    return t if t.size(2) <= max_size else t[:, :, -max_size:, :]
-
-
 class GPT(nn.Module):
-    """Stair-routed cache GPT with pair-sum input. W = window = block_size.
-    Per layer, two caches threaded across chunks:
-      - low_cache:  K[ℓ], V[ℓ] from previous chunk    (steady-state size W/2 - 1)
-      - high_cache: K[ℓ+1], V[ℓ+1] from previous ~2 chunks (steady-state size W - 1)
-    Strict per-query W/2 stair: recent W/2 from K[ℓ], older W/2 from K[ℓ+1].
-    Requires chunk_size <= W/2 (=block_size/2) for the strict semantics."""
-
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
@@ -193,17 +189,18 @@ class GPT(nn.Module):
         targets: (B, T_new) — pair-sum next-next-token targets; targets[i] is the token
                  to predict from the pair ending at idx[i] (same alignment as skewed_model).
                  None at eval skips loss.
-        caches: list of n_layers entries, each a tuple ((K_low, V_low), (K_high, V_high)).
-                Pass None (whole list) for the first chunk of a shard; subsequent calls
-                receive the new_caches returned by the previous call. Caches accumulate
-                gradient across sub-chunks for BPTT; reset to None at the start of each
-                optimizer step (do not carry across optimizer.step() boundaries).
+        caches: list of n_layers entries, each a tuple (low_new, high_old, high_new).
+                Each member is a (K, V) tuple of raw chunk tensors (W/2 positions), except
+                high_old which is None during the chunk-N=1 warmup. Pass None (whole list)
+                for the first chunk of a shard. Caches accumulate gradient across sub-chunks
+                for BPTT; reset to None at the start of each optimizer step (do not carry
+                across optimizer.step() boundaries).
         prev_tokens: (B, 1) — last token of previous chunk, or shard seed.
         Returns:
           logits: (B, T_new, vocab_size)
           loss: scalar cross-entropy, or None
-          new_caches: list of n_layers ((K_low, V_low), (K_high, V_high)) for the next call.
-                      Sizes trimmed to (W/2 - 1) for low and (W - 1) for high.
+          new_caches: list of n_layers (low_new, high_old, high_new) for the next call.
+                      All entries are W/2-sized raw chunk tensors (no cat or trim).
           new_prev_tokens: (B, 1) — last token of idx, to feed forward.
         """
         assert prev_tokens is not None, "prev_tokens (seed or carry-over) is required."
@@ -233,7 +230,10 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
-        # Build new caches for the next chunk.
+        # Build new caches for the next chunk — no cat, no trim, just pointer shuffles.
+        # Each cache entry: (low_new, high_old, high_new) of raw chunk K/V tensors.
+        # Shift rule: previous chunk's high_new becomes the new high_old; the new low_new
+        # and high_new are this chunk's K[ℓ] and K[ℓ+1] (or kv_only output for top layer).
         new_caches = []
         n_layers = len(self.h)
         for layer_idx in range(n_layers):
@@ -243,20 +243,16 @@ class GPT(nn.Module):
             else:
                 k_above, v_above = k_top, v_top
 
+            next_low_new = (k_l, v_l)
+            next_high_new = (k_above, v_above)
             if caches is None:
-                ext_low_k, ext_low_v = k_l, v_l
-                ext_high_k, ext_high_v = k_above, v_above
+                next_high_old = None  # next chunk (N=1) has no chunk N-2 to draw from
             else:
-                (old_low_k, old_low_v), (old_high_k, old_high_v) = caches[layer_idx]
-                ext_low_k = torch.cat([old_low_k, k_l], dim=2)
-                ext_low_v = torch.cat([old_low_v, v_l], dim=2)
-                ext_high_k = torch.cat([old_high_k, k_above], dim=2)
-                ext_high_v = torch.cat([old_high_v, v_above], dim=2)
-            max_low = W // 2 - 1
-            max_high = W - 1
-            new_low = (_trim(ext_low_k, max_low), _trim(ext_low_v, max_low))
-            new_high = (_trim(ext_high_k, max_high), _trim(ext_high_v, max_high))
-            new_caches.append((new_low, new_high))
+                # this chunk's incoming high_new shifts forward into the high_old slot
+                _, _, prev_high_new = caches[layer_idx]
+                next_high_old = prev_high_new
+
+            new_caches.append((next_low_new, next_high_old, next_high_new))
 
         new_prev_tokens = idx[:, -1:]
         return logits, loss, new_caches, new_prev_tokens

@@ -108,10 +108,6 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """Standard causal GPT with RoPE replacing learned positional embeddings.
-    Full-attention (not sliding window) — meant as a direct baseline against
-    the multi-scale model and the original standard GPT."""
-
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
