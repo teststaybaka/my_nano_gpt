@@ -1,7 +1,8 @@
 """Diff from model.py (standard GPT):
 - No positional embedding.
 - Each attention head gets its own sliding-window size T_h, log-uniformly spaced
-  from min_window to block_size. Per-head SDPA mask; no per-head storage change.
+  from min_window to block_size. Per-head mask via FlexAttention (BlockMask
+  cached by (T, device)); mask never materialized as a (n_heads, T, T) tensor.
 """
 
 import math
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 
 def _log_uniform_windows(min_w, max_w, n):
@@ -59,6 +61,22 @@ class MultiScaleAttention(nn.Module):
             torch.tensor(config.head_windows, dtype=torch.long),
             persistent=True,
         )
+        # BlockMask cache keyed by (T, device). Rebuilt only on new shape/device.
+        self._block_mask_cache = {}
+
+    def _get_block_mask(self, T, device):
+        key = (T, str(device))
+        cached = self._block_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        head_windows = self.head_windows
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & ((q_idx - kv_idx) < head_windows[h])
+        block_mask = create_block_mask(
+            mask_mod, B=None, H=self.n_heads, Q_LEN=T, KV_LEN=T, device=device,
+        )
+        self._block_mask_cache[key] = block_mask
+        return block_mask
 
     def forward(self, x):
         B, T, C = x.size()
@@ -70,15 +88,11 @@ class MultiScaleAttention(nn.Module):
         k = k.view(B, T, self.n_heads, head_size).transpose(1, 2)
         v = v.view(B, T, self.n_heads, head_size).transpose(1, 2)
 
-        # Per-head causal sliding-window mask of shape (n_heads, T, T):
-        # head h's query at position i attends to keys in [i - W_h + 1, i].
-        # SDPA broadcasts this mask across the batch dim.
-        pos = torch.arange(T, device=q.device)
-        dist = pos.view(1, T, 1) - pos.view(1, 1, T) # (1, T, T): query_pos - key_pos
-        W = self.head_windows.view(self.n_heads, 1, 1)
-        mask = (dist >= 0) & (dist < W) # causal + within window
-
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # Per-head causal sliding window via FlexAttention: head h's query at
+        # position i attends to keys in [i - W_h + 1, i]. Mask is evaluated
+        # lazily in-kernel and block-sparse, so nothing is materialized.
+        block_mask = self._get_block_mask(T, q.device)
+        y = flex_attention(q, k, v, block_mask=block_mask)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
