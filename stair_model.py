@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 
 @dataclass
@@ -40,6 +41,34 @@ class StairAttention(nn.Module):
         self.n_heads = config.n_heads
         self.n_embd = config.n_embd
         self.window_size = config.block_size
+        # BlockMask cache keyed by (T_new, T_low, T_high_total, device). Only a
+        # couple of distinct shapes occur (warmup vs steady state at training).
+        self._block_mask_cache = {}
+
+    def _get_block_mask(self, T_new, T_low, T_high_total, device):
+        key = (T_new, T_low, T_high_total, str(device))
+        cached = self._block_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        W = self.window_size
+        half_W = W // 2
+        def mask_mod(b, h, q_idx, kv_idx):
+            # K_combined layout: [K_high (T_high_total) | K_low+live (T_low + T_new)].
+            # K_high column j -> absolute position -T_high_total + j (all negative).
+            # K_low  column j -> absolute position -T_low + (j - T_high_total).
+            is_high = kv_idx < T_high_total
+            high_dist = q_idx - (kv_idx - T_high_total)
+            low_dist = q_idx - (kv_idx - T_high_total - T_low)
+            high_ok = (high_dist >= half_W) & (high_dist < W)
+            low_ok = (low_dist >= 0) & (low_dist < half_W)
+            return torch.where(is_high, high_ok, low_ok)
+        block_mask = create_block_mask(
+            mask_mod, B=None, H=None,
+            Q_LEN=T_new, KV_LEN=T_high_total + T_low + T_new,
+            device=device,
+        )
+        self._block_mask_cache[key] = block_mask
+        return block_mask
 
     def forward(self, x, cache=None):
         """
@@ -57,8 +86,6 @@ class StairAttention(nn.Module):
         """
         B, T_new, C = x.size()
         head_size = C // self.n_heads
-        W = self.window_size
-        half_W = W // 2
 
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -89,25 +116,12 @@ class StairAttention(nn.Module):
             V_combined = torch.cat([V_high_old, V_high_new, V_low, v], dim=2)
         T_high_total = K_combined.size(2) - T_low - T_new
 
-        # Build mask. Anchor positions relative to current chunk start = 0.
-        # K_high portion (first T_high_total cols) covers absolute positions [-T_high_total, -1].
-        # K_low portion (remaining cols)         covers absolute positions [-T_low, T_new - 1].
-        # Stair rule per query q:
-        #   recent W/2 (use K_low):  0 <= dist < half_W
-        #   older W/2  (use K_high): half_W <= dist < W
-        q_pos = torch.arange(T_new, device=q.device)
-
-        high_pos = torch.arange(-T_high_total, 0, device=q.device)
-        high_dist = q_pos.unsqueeze(1) - high_pos.unsqueeze(0) # (T_new, T_high_total)
-        high_mask = (high_dist >= half_W) & (high_dist < W)
-
-        low_pos = torch.arange(-T_low, T_new, device=q.device)
-        low_dist = q_pos.unsqueeze(1) - low_pos.unsqueeze(0) # (T_new, T_low + T_new)
-        low_mask = (low_dist >= 0) & (low_dist < half_W)
-
-        mask = torch.cat([high_mask, low_mask], dim=1)
-
-        y = F.scaled_dot_product_attention(q, K_combined, V_combined, attn_mask=mask)
+        # Stair routing via FlexAttention: recent W/2 distances come from the
+        # K_low slab (this layer's K, current + prev chunk); older W/2 come from
+        # the K_high slab (one-layer-deeper K, prev + prev-prev chunk). The
+        # mask_mod encodes both regions over the concatenated K_combined.
+        block_mask = self._get_block_mask(T_new, T_low, T_high_total, q.device)
+        y = flex_attention(q, K_combined, V_combined, block_mask=block_mask)
         return self._merge_heads(y, B, T_new, C), (k, v)
 
     def _merge_heads(self, y, B, T_new, C):
