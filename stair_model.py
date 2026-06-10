@@ -110,9 +110,9 @@ class StairAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, K_combined, V_combined, attn_mask=mask)
         return self._merge_heads(y, B, T_new, C), (k, v)
 
-    @staticmethod
-    def _merge_heads(y, B, T_new, C):
-        return y.transpose(1, 2).contiguous().view(B, T_new, C)
+    def _merge_heads(self, y, B, T_new, C):
+        y = y.transpose(1, 2).contiguous().view(B, T_new, C)
+        return self.c_proj(y)
 
 
 class MLP(nn.Module):

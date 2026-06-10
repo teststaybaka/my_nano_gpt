@@ -16,3 +16,9 @@ pair_sum_skewed_cache_model.pt
 pair_sum_skewed_cache_32x_context_model.pt
   HellaSwag: 0.3149
   LAMBADA: 0.2441 39.3536
+rope_model.pt
+  HellaSwag: 0.3308
+  LAMBADA: 0.2851 28.3969
+multi_scale_model.pt
+  HellaSwag: 0.3232
+  LAMBADA: 0.2645 33.6077
