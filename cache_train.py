@@ -84,7 +84,7 @@ print(f"total_batch_size: {total_batch_size}, B: {B}, context_length: {context_l
 T_dataloader = context_length
 train_dataloader = DataLoader(B=B, T=T_dataloader, process_rank=0, process_count=1, split="train")
 
-model = GPT(config)
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 

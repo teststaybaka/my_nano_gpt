@@ -193,7 +193,7 @@ def main():
     parser.add_argument('--model', required=True,
                         choices=['standard', 'rope', 'multi_scale', 'pair_sum', 'sliding', 'skewed', 'stair',
                                  'rope_sliding', 'rope_stair'])
-    parser.add_argument('--lengths', default='1024,2048,4096,8192,16384',
+    parser.add_argument('--lengths', default='1024,2048,4096,8192,16384,32768,65536',
                         help='Comma-separated lengths at which to report perplexity.')
     parser.add_argument('--stride', type=int, default=512,
                         help='Stride for standard/pair_sum sliding-window eval (ignored for cache).')
