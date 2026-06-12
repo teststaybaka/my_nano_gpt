@@ -23,14 +23,8 @@ families that means one forward; stair chunks at W/2 internally.
 
 Usage:
   python eval_short.py <checkpoint.pt> --model {standard|rope|multi_scale|pair_sum|sliding|skewed|stair}
-                                       [--task {val|hellaswag|lambada|all}]
+                                       [--task {hellaswag|lambada|all}]
                                        [--max-examples N]
-                                       [--val-context-length 4096]
-
---task val recomputes the training-recipe FineWeb-edu validation loss on the
-loaded checkpoint; it should match the training log's latest val line. Run it
-first when numbers look wrong — a large gap means the checkpoint was trained
-with different model code than this eval is importing.
 """
 import os
 import json
@@ -39,7 +33,6 @@ import argparse
 import torch
 import tiktoken
 import torch.nn.functional as F
-from glob import glob
 
 
 # ---- model dispatch -----------------------------------------------------
@@ -207,74 +200,6 @@ def compute_logp_per_token(model, family, tokens, device):
     return full_logps, full_greedy, first_scored
 
 
-# ---- FineWeb-edu validation loss (training-recipe replica) ---------------
-
-def eval_fineweb_val(model, family, config, device, val_steps=20, context_length=4096):
-    """Recomputes the training scripts' FineWeb-edu validation loss on the loaded
-    checkpoint. Should reproduce the latest `val` line of the training log (up to
-    compile/kernel noise); a big gap means checkpoint/model-code mismatch.
-
-    Recipes matched per family:
-      standard/pair_sum        : train.py — B=32, one model(x, y) per block_size batch
-      cache/stair_cache        : sliding_cache_train.py — B=16, BPTT span of
-                                 `context_length` chunked at block_size (stair: /2),
-                                 caches + prev_tokens threaded, seed token at x[:,0]
-      nt_cache/nt_stair_cache  : cache_train.py — same, next-token aligned: no seed,
-                                 chunks start at 0, 3-tuple forward
-    """
-    if not glob(os.path.join("fineweb_shards", "fineweb_val_*.npy")):
-        print("  SKIP fineweb val — fineweb_shards/fineweb_val_*.npy not found "
-              "(run prepare_fine_web_data.py)")
-        return None
-    from fine_web_data_loader import DataLoader
-
-    W = config.block_size
-    val_loss_accum = 0.0
-    if family in ('standard', 'pair_sum'):
-        B, T = 32, W
-        loader = DataLoader(B=B, T=T, process_rank=0, process_count=1, split="val")
-        print(f"FineWeb val (train.py recipe): B={B}, T={T}, {val_steps} batches")
-        with torch.no_grad():
-            for _ in range(val_steps):
-                x, y = loader.get_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    _, loss = model(x, y)
-                val_loss_accum += loss.detach() / val_steps
-    else:
-        B = 16
-        T = W if family in ('cache', 'nt_cache') else W // 2
-        assert context_length % T == 0, f"context_length {context_length} not divisible by chunk {T}"
-        sub_chunks = context_length // T
-        pair_seed = family in ('cache', 'stair_cache')  # pair-sum carry needs a seed token
-        T_dataloader = context_length + 1 if pair_seed else context_length
-        loader = DataLoader(B=B, T=T_dataloader, process_rank=0, process_count=1, split="val")
-        print(f"FineWeb val (cache recipe): B={B}, chunk T={T}, context={context_length}, "
-              f"{val_steps} batches, seed={pair_seed}")
-        with torch.no_grad():
-            for _ in range(val_steps):
-                x, y = loader.get_batch()
-                x, y = x.to(device), y.to(device)
-                cache_state = None
-                prev_tokens = x[:, 0:1] if pair_seed else None
-                sub_loss_total = 0.0
-                for sub in range(sub_chunks):
-                    start = (1 if pair_seed else 0) + sub * T
-                    idx = x[:, start:start + T]
-                    targets = y[:, start:start + T]
-                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                        if pair_seed:
-                            _, loss, cache_state, prev_tokens = model(idx, targets, cache_state, prev_tokens)
-                        else:
-                            _, loss, cache_state = model(idx, targets, cache_state)
-                    sub_loss_total = sub_loss_total + loss
-                val_loss_accum += (sub_loss_total / sub_chunks / val_steps).detach()
-
-    val_loss = val_loss_accum.item()
-    print(f"FineWeb-edu validation loss: {val_loss:.4f}")
-    return val_loss
-
-
 # ---- HellaSwag ----------------------------------------------------------
 
 def eval_hellaswag(model, family, config, enc, device, max_examples=None):
@@ -408,10 +333,7 @@ def main():
                         choices=['standard', 'rope', 'multi_scale', 'pair_sum', 'sliding', 'skewed', 'stair',
                                  'rope_sliding', 'rope_stair'])
     parser.add_argument('--task', type=str, default='all',
-                        choices=['val', 'hellaswag', 'lambada', 'all'])
-    parser.add_argument('--val-context-length', type=int, default=4096,
-                        help='BPTT span for cache-family fineweb val (match the '
-                             'training run, e.g. 32768 for the 32x models).')
+                        choices=['hellaswag', 'lambada', 'all'])
     parser.add_argument('--max-examples', type=int, default=None,
                         help='Limit examples per task (debug).')
     args = parser.parse_args()
@@ -425,10 +347,6 @@ def main():
 
     print(f"Family: {family}  |  block_size: {config.block_size}\n")
 
-    if args.task in ('val', 'all'):
-        eval_fineweb_val(model, family, config, device,
-                         context_length=args.val_context_length)
-        print()
     if args.task in ('hellaswag', 'all'):
         eval_hellaswag(model, family, config, enc, device, args.max_examples)
         print()
