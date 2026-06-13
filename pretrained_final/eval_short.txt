@@ -22,6 +22,15 @@ pair_sum_stair_model.pt
 rope_model.pt
   HellaSwag: 0.3308
   LAMBADA: 0.2851 28.3969
+rope_sliding_cache_model.pt
+  HellaSwag: 0.3258
+  LAMBADA: 0.2890 27.9450
+rope_stair_model.pt
+  HellaSwag: 0.3275
+  LAMBADA: 0.2670 31.1263
 multi_scale_model.pt
   HellaSwag: 0.3232
   LAMBADA: 0.2645 33.6077
+multi_scale_tied_model.pt
+  HellaSwag: 0.3225
+  LAMBADA: 0.2758 31.9650
