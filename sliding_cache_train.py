@@ -3,7 +3,7 @@ import time
 import math
 import torch
 from sliding_cache_model import GPT, GPTConfig
-from fine_web_data_loader import DataLoader
+from data_loader import DataLoader
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)

@@ -17,7 +17,7 @@ import time
 import math
 import argparse
 import torch
-from fine_web_data_loader import DataLoader
+from data_loader import DataLoader
 from rope_sliding_cache_model import GPT, GPTConfig
 # from rope_stair_model import GPT, GPTConfig
 # from multi_scale_stair_model import GPT, GPTConfig

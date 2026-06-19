@@ -4,7 +4,7 @@ import torch
 from glob import glob
 
 class DataLoader:
-    def __init__(self, B, T, process_rank, process_count, split="train"):
+    def __init__(self, B, T, process_rank, process_count, split="train", shard_dir="fineweb_shards"):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -12,11 +12,10 @@ class DataLoader:
         self.split = split
 
         # Find all shard files for this split
-        shard_dir = "fineweb_shards"
         if split == "train":
-            pattern = os.path.join(shard_dir, "fineweb_train_*.npy")
+            pattern = os.path.join(shard_dir, "*_train_*.npy")
         else:  # val
-            pattern = os.path.join(shard_dir, "fineweb_val_*.npy")
+            pattern = os.path.join(shard_dir, "*_val_*.npy")
 
         self.shard_files = sorted(glob(pattern))
         assert len(self.shard_files) > 0, f"No shard files found for split '{split}' in {shard_dir}"
